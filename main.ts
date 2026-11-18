@@ -396,6 +396,13 @@ function putObject(repo, type, data) {
   repo.packCache.clear();
   return oid;
 }
+// Store an object whose oid readPack already computed while unpacking a
+// received pack: skips the re-hash and the per-object cache clear. The caller
+// must clear repo.packCache once after storing the batch.
+function putObjectKnown(repo, type, data, oid) {
+  if (!repo.objects.has(oid)) repo.objects.set(oid, { type, data });
+  return oid;
+}
 function getObject(repo, oid) {
   return repo.objects.get(oid) || null;
 }
@@ -769,12 +776,12 @@ function sidebandFrame(band, data) {
 
 // Parse a v2 command request body into { command, args: string[], extra }.
 // Lines before the first delim are args; the rest is the request body.
-function parseV2Request(buf) {
-  const { packets } = decodePktLines(buf);
+function parseV2Request(buf, packets) {
+  const pkts = packets || decodePktLines(buf).packets;
   const args = [];
   let seenDelim = false;
   let body = Buffer.alloc(0);
-  for (const p of packets) {
+  for (const p of pkts) {
     if (p.kind === 'delim') {
       seenDelim = true;
       continue;
@@ -807,10 +814,10 @@ function parseLsRefsArgs(args) {
   return { prefix, peel, symrefs, unborn, refsRequested };
 }
 
-function handleUploadPackV2(req, res, repo, body) {
+function handleUploadPackV2(req, res, repo, body, packets) {
   let parsed;
   try {
-    parsed = parseV2Request(body);
+    parsed = parseV2Request(body, packets);
   } catch {
     res.writeHead(400, { 'x-github-request-id': nextReqId() });
     res.end();
@@ -821,6 +828,18 @@ function handleUploadPackV2(req, res, repo, body) {
     // ls-refs arguments (peel, symrefs, unborn, ref-prefix) follow the delim.
     const lsArgs = parsed.body.toString('utf8').split('\n').filter((s) => s.length > 0);
     const { prefix, peel, symrefs, unborn } = parseLsRefsArgs(lsArgs);
+    // ls-refs response is fully determined by these args + repo state, and the
+    // cache is cleared on every mutation, so cache the whole response buffer.
+    const lsKey = `lsrefs|${prefix || ''}|${peel ? 1 : 0}|${symrefs ? 1 : 0}|${unborn ? 1 : 0}`;
+    const cachedLs = repo.packCache.get(lsKey);
+    if (cachedLs) {
+      res.writeHead(200, {
+        'content-type': 'application/x-git-upload-pack-result',
+        'x-github-request-id': nextReqId(),
+      });
+      res.end(cachedLs);
+      return;
+    }
     const items = [];
     const h = headOid(repo);
     const refs = [...repo.refs.entries()].sort((a, b) => (a[0] < b[0] ? -1 : 1));
@@ -844,6 +863,7 @@ function handleUploadPackV2(req, res, repo, body) {
     }
     items.push('flush');
     const out = pktLines(items);
+    repo.packCache.set(lsKey, out);
     res.writeHead(200, {
       'content-type': 'application/x-git-upload-pack-result',
       'x-github-request-id': nextReqId(),
@@ -867,50 +887,60 @@ function handleUploadPackV2(req, res, repo, body) {
       else if (s.startsWith('deepen-since')) deepen = 1;
     }
     if (deepen > 0) depth = deepen;
-    const acks = computeAcks(repo, wants, haves);
-    const cacheKey = `fetch|${wants.join(',')}|${haves.join(',')}|${depth === null ? '' : depth}|${clientShallow.join(',')}`;
-    let cached = repo.packCache.get(cacheKey);
-    let pack;
-    let shallow;
-    let unshallow;
-    if (cached) {
-      ({ pack, shallow, unshallow } = cached);
-    } else {
-      const computed = computeFetch(repo, wants, haves, depth, clientShallow, clientShallow);
-      shallow = computed.shallow;
-      unshallow = computed.unshallow;
-      pack = writePack(computed.send);
-      repo.packCache.set(cacheKey, { pack, shallow, unshallow });
-    }
-    const items = [];
-    items.push('acknowledgments\n');
-    if (acks.length) {
-      for (const a of acks) items.push(`ACK ${a}\n`);
-      items.push('ready\n');
-    } else {
-      items.push('NAK\n');
-    }
-    items.push('delim');
-    if (shallow.length || unshallow.length) {
-      items.push('shallow-info\n');
-      for (const s of shallow) items.push(`shallow ${s}\n`);
-      for (const s of unshallow) items.push(`unshallow ${s}\n`);
+    // The whole fetch response is fully determined by wants/haves/depth/shallow
+    // + repo state (cache cleared on every mutation), so cache the assembled
+    // response buffer: on a hit this skips the ack walk, the refs sort, the
+    // pkt-line build, the sideband frame and the final concat.
+    const respKey = `resp2|${wants.join(',')}|${haves.join(',')}|${depth === null ? '' : depth}|${clientShallow.join(',')}`;
+    let resp = repo.packCache.get(respKey);
+    if (!resp) {
+      const acks = computeAcks(repo, wants, haves);
+      const cacheKey = `fetch|${wants.join(',')}|${haves.join(',')}|${depth === null ? '' : depth}|${clientShallow.join(',')}`;
+      let cached = repo.packCache.get(cacheKey);
+      let pack;
+      let shallow;
+      let unshallow;
+      if (cached) {
+        ({ pack, shallow, unshallow } = cached);
+      } else {
+        const computed = computeFetch(repo, wants, haves, depth, clientShallow, clientShallow);
+        shallow = computed.shallow;
+        unshallow = computed.unshallow;
+        pack = writePack(computed.send);
+        repo.packCache.set(cacheKey, { pack, shallow, unshallow });
+      }
+      const items = [];
+      items.push('acknowledgments\n');
+      if (acks.length) {
+        for (const a of acks) items.push(`ACK ${a}\n`);
+        items.push('ready\n');
+      } else {
+        items.push('NAK\n');
+      }
       items.push('delim');
+      if (shallow.length || unshallow.length) {
+        items.push('shallow-info\n');
+        for (const s of shallow) items.push(`shallow ${s}\n`);
+        for (const s of unshallow) items.push(`unshallow ${s}\n`);
+        items.push('delim');
+      }
+      items.push('wanted-refs\n');
+      for (const [ref, oid] of [...repo.refs.entries()].sort((a, b) => (a[0] < b[0] ? -1 : 1))) {
+        if (wants.includes(oid)) items.push(`${oid} ${ref}\n`);
+      }
+      items.push('delim');
+      items.push('packfile\n');
+      const head = pktLines(items);
+      const banded = sidebandFrame(1, pack);
+      const tail = pktLines(['flush']);
+      resp = Buffer.concat([head, banded, tail]);
+      repo.packCache.set(respKey, resp);
     }
-    items.push('wanted-refs\n');
-    for (const [ref, oid] of [...repo.refs.entries()].sort((a, b) => (a[0] < b[0] ? -1 : 1))) {
-      if (wants.includes(oid)) items.push(`${oid} ${ref}\n`);
-    }
-    items.push('delim');
-    items.push('packfile\n');
-    const head = pktLines(items);
-    const banded = sidebandFrame(1, pack);
-    const tail = pktLines(['flush']);
     res.writeHead(200, {
       'content-type': 'application/x-git-upload-pack-result',
       'x-github-request-id': nextReqId(),
     });
-    res.end(Buffer.concat([head, banded, tail]));
+    res.end(resp);
     return;
   }
   jsonError(res, 400, `unknown upload-pack command ${command}`);
@@ -918,11 +948,11 @@ function handleUploadPackV2(req, res, repo, body) {
 
 // v0 fetch: two-section request (wants, then haves + done). Response: NAK/ACK lines
 // + optional shallow lines, then the pack in sideband band 1.
-function handleUploadPackV0(req, res, repo, body) {
-  const { packets } = decodePktLines(body);
+function handleUploadPackV0(req, res, repo, body, packets) {
+  const pkts = packets || decodePktLines(body).packets;
   const sections = [];
   let cur = [];
-  for (const p of packets) {
+  for (const p of pkts) {
     if (p.kind === 'flush') {
       sections.push(cur);
       cur = [];
@@ -950,37 +980,45 @@ function handleUploadPackV0(req, res, repo, body) {
     }
   }
   if (deepen > 0) depth = deepen;
-  const acks = computeAcks(repo, wants, haves);
-  const cacheKey = `fetch|${wants.join(',')}|${haves.join(',')}|${depth === null ? '' : depth}|${clientShallow.join(',')}`;
-  let cached = repo.packCache.get(cacheKey);
-  let pack;
-  let shallow;
-  let unshallow;
-  if (cached) {
-    ({ pack, shallow, unshallow } = cached);
-  } else {
-    const computed = computeFetch(repo, wants, haves, depth, clientShallow, clientShallow);
-    shallow = computed.shallow;
-    unshallow = computed.unshallow;
-    pack = writePack(computed.send);
-    repo.packCache.set(cacheKey, { pack, shallow, unshallow });
+  // Same full-response cache as the v2 fetch (see resp2): the v0 response is
+  // fully determined by wants/haves/depth/shallow + repo state.
+  const respKey = `resp0|${wants.join(',')}|${haves.join(',')}|${depth === null ? '' : depth}|${clientShallow.join(',')}`;
+  let resp = repo.packCache.get(respKey);
+  if (!resp) {
+    const acks = computeAcks(repo, wants, haves);
+    const cacheKey = `fetch|${wants.join(',')}|${haves.join(',')}|${depth === null ? '' : depth}|${clientShallow.join(',')}`;
+    let cached = repo.packCache.get(cacheKey);
+    let pack;
+    let shallow;
+    let unshallow;
+    if (cached) {
+      ({ pack, shallow, unshallow } = cached);
+    } else {
+      const computed = computeFetch(repo, wants, haves, depth, clientShallow, clientShallow);
+      shallow = computed.shallow;
+      unshallow = computed.unshallow;
+      pack = writePack(computed.send);
+      repo.packCache.set(cacheKey, { pack, shallow, unshallow });
+    }
+    const parts = [];
+    if (acks.length) {
+      for (const a of acks) parts.push(pkt(`ACK ${a}\n`));
+    } else if (haves.length) {
+      parts.push(pkt('NAK\n'));
+    } else {
+      parts.push(pkt('NAK\n'));
+    }
+    for (const s of shallow) parts.push(pkt(`shallow ${s}\n`));
+    for (const s of unshallow) parts.push(pkt(`unshallow ${s}\n`));
+    parts.push(sidebandFrame(1, pack));
+    resp = Buffer.concat(parts);
+    repo.packCache.set(respKey, resp);
   }
-  const parts = [];
-  if (acks.length) {
-    for (const a of acks) parts.push(pkt(`ACK ${a}\n`));
-  } else if (haves.length) {
-    parts.push(pkt('NAK\n'));
-  } else {
-    parts.push(pkt('NAK\n'));
-  }
-  for (const s of shallow) parts.push(pkt(`shallow ${s}\n`));
-  for (const s of unshallow) parts.push(pkt(`unshallow ${s}\n`));
-  parts.push(sidebandFrame(1, pack));
   res.writeHead(200, {
     'content-type': 'application/x-git-upload-pack-result',
     'x-github-request-id': nextReqId(),
   });
-  res.end(Buffer.concat(parts));
+  res.end(resp);
 }
 
 function handleUploadPack(req, res, repo, body) {
@@ -990,13 +1028,24 @@ function handleUploadPack(req, res, repo, body) {
   }
   if (req.headers['git-protocol'] === 'version=2' || body.subarray(0, 4).toString('ascii') === '0012' || body.toString('utf8', 4, 11).startsWith('command')) {
     // A v2 request starts with a pkt-line whose payload is "command=...".
-    let isV2 = false;
+    // Decode the pkt-lines once here and hand the packets to the v2/v0
+    // handlers instead of decoding the body a second time inside them.
+    let packets = null;
     try {
-      const peek = decodePktLines(body).packets[0];
-      isV2 = !!peek && peek.kind === 'data' && peek.payload.toString('utf8').startsWith('command=');
-    } catch { /* not a v2 request */ }
-    if (isV2) {
-      handleUploadPackV2(req, res, repo, body);
+      packets = decodePktLines(body).packets;
+    } catch { /* not a v2 request; fall through to the v0 handler */ }
+    const peek = packets && packets[0];
+    if (peek && peek.kind === 'data' && peek.payload.toString('utf8').startsWith('command=')) {
+      handleUploadPackV2(req, res, repo, body, packets);
+      return;
+    }
+    if (packets) {
+      try {
+        handleUploadPackV0(req, res, repo, body, packets);
+      } catch {
+        res.writeHead(400, { 'x-github-request-id': nextReqId() });
+        res.end();
+      }
       return;
     }
   }
@@ -1044,7 +1093,8 @@ function handleReceivePack(req, res, repo, body) {
       jsonError(res, 400, 'packfile is malformed');
       return;
     }
-    for (const o of stored.objects) putObject(repo, o.type, o.data);
+    for (const o of stored.objects) putObjectKnown(repo, o.type, o.data, o.oid);
+    repo.packCache.clear();
   }
   let anyError = false;
   for (const cmd of commands) {
@@ -1281,6 +1331,7 @@ function newIssue(repo, title, body, labelNames) {
   const n = repo.nextNumber;
   repo.nextNumber += 1;
   const sec = nextTimeSec();
+  const at = isoOf(sec);
   const issue = {
     id: nextId(),
     number: n,
@@ -1289,8 +1340,8 @@ function newIssue(repo, title, body, labelNames) {
     state: 'open',
     labels,
     author: VIEWER.login,
-    createdAt: isoOf(sec),
-    updatedAt: isoOf(sec),
+    createdAt: at,
+    updatedAt: at,
     closedAt: null,
     createdSeq: sec,
     jsonCache: null,
